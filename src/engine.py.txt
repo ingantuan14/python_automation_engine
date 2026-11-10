@@ -1,0 +1,112 @@
+
+import asyncio
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import httpx
+import aiofiles
+
+# Enterprise Logging Configuration
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("EnterpriseSyncEngine")
+
+def heavy_cpu_bound_signature_verification(payload: str) -> bool:
+    """
+    [CONCEPT 5: Blocking Code Hazard]
+    Simulates a heavy cryptographic signature check or complex data validation 
+    routine. If executed directly inside an async function, this synchronous 
+    blocking loop would freeze the entire Event Loop.
+    """
+    time.sleep(0.02)  # Simulating heavy CPU cycles
+    return len(payload) > 0
+
+async def log_audit_event(message: str):
+    """
+    [CONCEPT 6: Async Context Managers & File I/O]
+    Uses aiofiles to write audit logs asynchronously without blocking the event loop.
+    """
+    await asyncio.sleep(0) # Yield point
+    async with aiofiles.open("audit_trail.log", mode="a", encoding="utf-8") as f:
+        await f.write(f"{message}\n")
+
+async def sync_supplier_sku(
+    client: httpx.AsyncClient, 
+    semaphore: asyncio.Semaphore, 
+    sku_id: int, 
+    executor: ThreadPoolExecutor
+):
+    """
+    [CONCEPT 2: Coroutines (async def & await)]
+    A specialized coroutine worker handling individual SKU synchronization.
+    """
+    # Rate limiting via semaphore (protecting downstream supplier APIs)
+    async with semaphore:
+        url = f"https://api.supplier-hub.internal/v1/inventory/{sku_id}"
+        try:
+            # [CONCEPT 6: Async Sockets / HTTP Client]
+            # Reusing the persistent httpx.AsyncClient connection pool
+            response = await client.get(url, timeout=5.0)
+            
+            if response.status_code == 200:
+                data = response.json()
+                payload_str = str(data)
+                
+                # [CONCEPT 5: Using Executors for Blocking Code]
+                # Offloading CPU-bound tasks to a thread pool executor so the event loop remains free
+                loop = asyncio.get_running_loop()
+                is_valid = await loop.run_in_executor(
+                    executor, 
+                    heavy_cpu_bound_signature_verification, 
+                    payload_str
+                )
+                
+                if is_valid:
+                    msg = f"[SUCCESS] SKU {sku_id} synchronized and verified."
+                    logger.info(msg)
+                    await log_audit_event(msg)
+                else:
+                    logger.warning(f"[WARNING] SKU {sku_id} failed validation checks.")
+            else:
+                logger.error(f"[ERROR] SKU {sku_id} returned HTTP status {response.status_code}")
+                
+        except httpx.RequestError as exc:
+            logger.error(f"[CRITICAL] Network failure communicating with SKU {sku_id}: {exc}")
+
+async def main():
+    """
+    [CONCEPT 1: The Event Loop & Orchestration]
+    The main entry point where the event loop coordinates execution.
+    """
+    skus_to_sync = range(3001, 3021)  # Simulating 20 enterprise SKUs
+    
+    # Concurrency control (Max 5 parallel requests to prevent HTTP 429 Rate Limiting)
+    rate_limiter = asyncio.Semaphore(5)
+    
+    # Thread pool for offloading blocking CPU operations safely
+    with ThreadPoolExecutor(max_workers=3) as cpu_executor:
+        # [CONCEPT 6: Persistent Connection Pooling via Context Manager]
+        async with httpx.AsyncClient() as client:
+            # [CONCEPT 4: asyncio.TaskGroup vs asyncio.gather]
+            try:
+                # TaskGroup (Python 3.11+) ensures structured concurrency:
+                # If any single task raises an unhandled exception, it automatically 
+                # cancels all other pending tasks in the group, preventing rogue dangling coroutines.
+                async with asyncio.TaskGroup() as tg:
+                    for sku_id in skus_to_sync:
+                        tg.create_task(
+                            sync_supplier_sku(client, rate_limiter, sku_id, cpu_executor)
+                        )
+            except Exception as e:
+                logger.critical(f"TaskGroup aborted due to critical failure: {e}")
+
+if __name__ == "__main__":
+    start_time = time.time()
+    logger.info("Initializing Enterprise Async Synchronization Engine...")
+    
+    # [CONCEPT 1: Starting the Event Loop Engine]
+    asyncio.run(main())
+    
+    logger.info(f"Sync pipeline terminated. Total runtime: {time.time() - start_time:.2f}s")
